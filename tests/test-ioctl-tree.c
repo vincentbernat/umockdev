@@ -23,9 +23,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <netinet/in.h>
 #include <linux/usbdevice_fs.h>
 #include <linux/input.h>
 #include <linux/sockios.h>
+#include <linux/if.h>
 #include <linux/ethtool.h>
 
 #include "ioctl_tree.h"
@@ -562,18 +564,64 @@ t_ethtool(void)
     ioctl_tree *tree = NULL, *t;
     FILE *f;
     char contents[1000];
-    struct ethtool_wolinfo wolinfo = { ETHTOOL_GWOL, 1, 42, "s3kr1t" };
+    struct ifreq cmd = { .ifr_ifrn = { .ifrn_name = "eth0" },
+                         .ifr_ifru = { .ifru_data = &(struct ethtool_cmd) {
+            ETHTOOL_GSET,
+            SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+            SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+            SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+            SUPPORTED_Autoneg |
+            SUPPORTED_TP | SUPPORTED_MII,
+            ADVERTISED_10baseT_Half | ADVERTISED_10baseT_Full |
+            ADVERTISED_100baseT_Half | ADVERTISED_100baseT_Full |
+            ADVERTISED_1000baseT_Half | ADVERTISED_1000baseT_Full |
+            ADVERTISED_Autoneg |
+            ADVERTISED_TP | ADVERTISED_MII |
+            ADVERTISED_Pause | ADVERTISED_Asym_Pause,
+            100, DUPLEX_FULL,
+            PORT_MII,
+            0, XCVR_INTERNAL,
+            AUTONEG_ENABLE,
+            ETH_MDIO_SUPPORTS_C22,
+            0, 0,
+            0,
+            0, 0,
+            SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+            SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full } } };
+    struct ifreq drvinfo = { .ifr_ifrn = { .ifrn_name = "eth0" },
+                             .ifr_ifru = { .ifru_data = &(struct ethtool_drvinfo) {
+                ETHTOOL_GDRVINFO,
+                "r8169", "2.3LK-NAPI",
+                "", "0000:03:00.0",
+                "", "",
+                0, 13,
+                0, 0,  256 } } };
+    struct ifreq wolinfo = { .ifr_ifrn = { .ifrn_name = "eth0" },
+                             .ifr_ifru = { .ifru_data = &(struct ethtool_wolinfo) {
+                ETHTOOL_GWOL, 1, 42, "s3kr1t" } } };
     int ret;
 
     /* create tree from ioctl */
-    tree = ioctl_tree_new_from_bin(SIOCETHTOOL, &wolinfo, 0);
+    tree = ioctl_tree_new_from_bin(SIOCETHTOOL, &cmd, 0);
     g_assert(tree != NULL);
     g_assert(ioctl_tree_insert(NULL, tree) == NULL);
-
-    /* insert duplicate, should be recognized as such */
+    t = ioctl_tree_new_from_bin(SIOCETHTOOL, &drvinfo, 0);
+    g_assert(t != NULL);
+    g_assert(ioctl_tree_insert(tree, t) == NULL);
     t = ioctl_tree_new_from_bin(SIOCETHTOOL, &wolinfo, 0);
     g_assert(t != NULL);
-    g_assert(ioctl_tree_insert(tree, t) == tree);
+    g_assert(ioctl_tree_insert(tree, t) == NULL);
+
+    /* insert duplicate, should be recognized as such */
+    t = ioctl_tree_new_from_bin(SIOCETHTOOL, &cmd, 0);
+    g_assert(t != NULL);
+    g_assert(ioctl_tree_insert(tree, t) != NULL);
+    t = ioctl_tree_new_from_bin(SIOCETHTOOL, &drvinfo, 0);
+    g_assert(t != NULL);
+    g_assert(ioctl_tree_insert(tree, t) != NULL);
+    t = ioctl_tree_new_from_bin(SIOCETHTOOL, &wolinfo, 0);
+    g_assert(t != NULL);
+    g_assert(ioctl_tree_insert(tree, t) != NULL);
 
     /* write it */
     f = tmpfile();
@@ -586,9 +634,13 @@ t_ethtool(void)
     g_assert_cmpint(fread(contents, 1, sizeof(contents), f), >, 10);
     g_assert_cmpstr(contents, ==,
 #if __BYTE_ORDER == __LITTLE_ENDIAN
-		    "SIOCETHTOOL 0 05000000010000002A00000073336B723174\n"
+                    "SIOCETHTOOL 0 eth0 01000000FF020000FF62000064000102000001010000000000000000000000000F0000000000000000000000\n"
+                    "SIOCETHTOOL 0 eth0 030000007238313639000000000000000000000000000000000000000000000000000000322E334C4B2D4E415049000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000303030303A30333A30302E3000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000D000000000000000000000000010000\n"
+		    "SIOCETHTOOL 0 eth0 05000000010000002A00000073336B723174\n"
 #else
-		    "SIOCETHTOOL 0 00000005000000010000002A73336B723174\n"
+                    "SIOCETHTOOL 0 eth0 00000001000002FF000062FF00640102000001010000000000000000000000000000000F0000000000000000\n"
+                    "SIOCETHTOOL 0 eth0 000000037238313639000000000000000000000000000000000000000000000000000000322E334C4B2D4E415049000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000303030303A30333A30302E3000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000D000000000000000000000100\n"
+		    "SIOCETHTOOL 0 eth0 00000005000000010000002A73336B723174\n"
 #endif
     );
     rewind(f);
@@ -597,18 +649,69 @@ t_ethtool(void)
     tree = ioctl_tree_read(f);
     fclose(f);
 
+    /* execute ETHTOOL_GSET */
+    memset(&cmd.ifr_data, 0xAA, sizeof(struct ethtool_cmd));
+    ((struct ethtool_cmd *)cmd.ifr_data)->cmd = ETHTOOL_GSET;
+    g_assert(ioctl_tree_execute(tree, NULL, SIOCETHTOOL, &cmd, &ret));
+    g_assert(ret == 0);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->cmd, ==, ETHTOOL_GSET);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->supported, ==,
+                     SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+                     SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+                     SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+                     SUPPORTED_Autoneg |
+                     SUPPORTED_TP | SUPPORTED_MII);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->advertising, ==,
+                     ADVERTISED_10baseT_Half | ADVERTISED_10baseT_Full |
+                     ADVERTISED_100baseT_Half | ADVERTISED_100baseT_Full |
+                     ADVERTISED_1000baseT_Half | ADVERTISED_1000baseT_Full |
+                     ADVERTISED_Autoneg |
+                     ADVERTISED_TP | ADVERTISED_MII |
+                     ADVERTISED_Pause | ADVERTISED_Asym_Pause);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->speed, ==, 100);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->duplex, ==, DUPLEX_FULL);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->port, ==, PORT_MII);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->phy_address, ==, 0);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->transceiver, ==, XCVR_INTERNAL);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->autoneg, ==, AUTONEG_ENABLE);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->mdio_support, ==, ETH_MDIO_SUPPORTS_C22);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->maxtxpkt, ==, 0);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->maxrxpkt, ==, 0);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->speed_hi, ==, 0);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->eth_tp_mdix, ==, 0);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->eth_tp_mdix_ctrl, ==, 0);
+    g_assert_cmpuint(((struct ethtool_cmd *)cmd.ifr_data)->lp_advertising, ==,
+                     SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+                     SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full);
+
+    /* execute ETHTOOL_GDRVINFO */
+    memset(&drvinfo.ifr_data, 0xAA, sizeof(struct ethtool_drvinfo));
+    ((struct ethtool_drvinfo *)drvinfo.ifr_data)->cmd = ETHTOOL_GDRVINFO;
+    g_assert(ioctl_tree_execute(tree, NULL, SIOCETHTOOL, &drvinfo, &ret));
+    g_assert(ret == 0);
+    g_assert_cmpuint(((struct ethtool_drvinfo *)drvinfo.ifr_data)->cmd, ==, ETHTOOL_GDRVINFO);
+    g_assert_cmpstr(((struct ethtool_drvinfo *)drvinfo.ifr_data)->driver, ==, "r8169");
+    g_assert_cmpstr(((struct ethtool_drvinfo *)drvinfo.ifr_data)->version, ==, "2.3LK-NAPI");
+    g_assert_cmpstr(((struct ethtool_drvinfo *)drvinfo.ifr_data)->fw_version, ==, "");
+    g_assert_cmpstr(((struct ethtool_drvinfo *)drvinfo.ifr_data)->bus_info, ==, "0000:03:00.0");
+    g_assert_cmpuint(((struct ethtool_drvinfo *)drvinfo.ifr_data)->n_priv_flags, ==, 0);
+    g_assert_cmpuint(((struct ethtool_drvinfo *)drvinfo.ifr_data)->n_stats, ==, 13);
+    g_assert_cmpuint(((struct ethtool_drvinfo *)drvinfo.ifr_data)->testinfo_len, ==, 0);
+    g_assert_cmpuint(((struct ethtool_drvinfo *)drvinfo.ifr_data)->eedump_len, ==, 0);
+    g_assert_cmpuint(((struct ethtool_drvinfo *)drvinfo.ifr_data)->regdump_len, ==, 256);
+
     /* execute ETHTOOL_GWOL */
-    memset(&wolinfo, 0xAA, sizeof(wolinfo));
-    wolinfo.cmd = ETHTOOL_GWOL;
+    memset(&wolinfo.ifr_data, 0xAA, sizeof(struct ethtool_wolinfo));
+    ((struct ethtool_wolinfo *)wolinfo.ifr_data)->cmd = ETHTOOL_GWOL;
     g_assert(ioctl_tree_execute(tree, NULL, SIOCETHTOOL, &wolinfo, &ret));
     g_assert(ret == 0);
-    g_assert_cmpuint(wolinfo.cmd, ==, ETHTOOL_GWOL);
-    g_assert_cmpuint(wolinfo.supported, ==, 1);
-    g_assert_cmpuint(wolinfo.wolopts, ==, 42);
-    g_assert(memcmp(wolinfo.sopass, "s3kr1t", 6) == 0);
+    g_assert_cmpuint(((struct ethtool_wolinfo *)wolinfo.ifr_data)->cmd, ==, ETHTOOL_GWOL);
+    g_assert_cmpuint(((struct ethtool_wolinfo *)wolinfo.ifr_data)->supported, ==, 1);
+    g_assert_cmpuint(((struct ethtool_wolinfo *)wolinfo.ifr_data)->wolopts, ==, 42);
+    g_assert(memcmp(((struct ethtool_wolinfo *)wolinfo.ifr_data)->sopass, "s3kr1t", 6) == 0);
     /* does not write into padding (if we have any) */
     if (sizeof(wolinfo) > tree->type->get_data_size(tree->id, tree->data))
-	g_assert_cmpuint(wolinfo.sopass[6], ==, 0xAA);
+	g_assert_cmpuint(((struct ethtool_wolinfo *)wolinfo.ifr_data)->sopass[6], ==, 0xAA);
 }
 
 int

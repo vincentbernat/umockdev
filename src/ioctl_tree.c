@@ -24,9 +24,11 @@
 #include <errno.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
+#include <netinet/in.h>
 #include <linux/usbdevice_fs.h>
 #include <linux/input.h>
 #include <linux/sockios.h>
+#include <linux/if.h>
 #include <linux/ethtool.h>
 
 #include "ioctl_tree.h"
@@ -611,6 +613,95 @@ ioctl_varlenstruct_in_execute(const ioctl_tree * node, unsigned long id, void *a
 
 /***********************************
  *
+ * ifreq-based ioctls (network).
+ *
+ * Only the ifr_data case is handled. For other cases, the structure
+ * is of fixed size and simplestruct can be used.
+ *
+ ***********************************/
+
+static void
+ioctl_structifreq_init_from_bin(ioctl_tree * node, const void *data)
+{
+    const struct ifreq *ifr = data;
+    struct ifreq *tifr;
+    size_t size = node->type->get_data_size(node->id, data);
+    DBG("ioctl_structifreq_init_from_bin: %s(%lX): size is %lu bytes\n", node->type->name, node->id, size);
+    node->data = tifr = calloc(1, sizeof(struct ifreq));
+    memcpy(tifr, ifr, sizeof(struct ifreq));
+    tifr->ifr_data = calloc(1, size);
+    memcpy(tifr->ifr_data, ifr->ifr_data, size);
+}
+
+static int
+ioctl_structifreq_init_from_text(ioctl_tree * node, const char *data)
+{
+    struct ifreq *ifr = node->data = calloc(1, sizeof(struct ifreq));
+    char *space = strchr(data, ' ');
+    if (space == NULL) {
+	DBG("ioctl_structifreq_init_from_text: failed to parse record '%s'\n", data);
+	free(ifr);
+	return FALSE;
+    }
+    strncpy(ifr->ifr_name, data, space - data);
+
+    size_t data_len = strlen(space + 1) / 2;
+    ifr->ifr_data = malloc(data_len);
+
+    if (!read_hex(space + 1, ifr->ifr_data, data_len)) {
+	fprintf(stderr, "ioctl_structifreq_init_from_text: failed to parse '%s'\n", data);
+	free(ifr->ifr_data);
+	free(ifr);
+	return FALSE;
+    }
+
+    /* verify that the text data size actually matches get_data_size() */
+    size_t size = node->type->get_data_size(node->id, node->data);
+
+    if (size != data_len) {
+	fprintf(stderr, "ioctl_structifreq_init_from_text: ioctl %lX: expected data length %zi, but got %zu bytes from text data\n",
+		node->id, size, data_len);
+	free(ifr->ifr_data);
+	free(ifr);
+	return FALSE;
+    }
+
+    return TRUE;
+}
+
+static void
+ioctl_structifreq_free_data(ioctl_tree * node)
+{
+    if (node->data != NULL) {
+	struct ifreq *ifr = node->data;
+	free(ifr->ifr_data);
+	free(ifr);
+    }
+}
+
+static void
+ioctl_structifreq_write(const ioctl_tree * node, FILE * f)
+{
+    struct ifreq *ifr = node->data;
+    assert(ifr != NULL);
+    fprintf(f, "%s ", ifr->ifr_name);
+    write_hex(f, ifr->ifr_data, node->type->get_data_size(node->id, node->data));
+}
+
+static int
+ioctl_structifreq_equal(const ioctl_tree * n1, const ioctl_tree * n2)
+{
+    size_t size1 = n1->type->get_data_size(n1->id, n1->data);
+    size_t size2 = n2->type->get_data_size(n2->id, n2->data);
+    struct ifreq *ifr1 = n1->data;
+    struct ifreq *ifr2 = n2->data;
+    return (n1->id == n2->id && size1 == size2 &&
+	    !strncmp(ifr1->ifr_name, ifr2->ifr_name, IFNAMSIZ) &&
+	    memcmp(ifr1->ifr_data, ifr2->ifr_data, size1) == 0);
+}
+
+/***********************************
+ *
  * USBDEVFS_REAPURB
  *
  ***********************************/
@@ -799,10 +890,15 @@ static size_t
 ioctl_ethtool_data_len(unsigned long id, const void* data)
 {
     /* see /usr/include/linux/ethtool.h */
-    uint32_t cmd = *((uint32_t*) data);
+    const struct ifreq *ifr = data;
+    uint32_t cmd = *((uint32_t*) ifr->ifr_data);
     DBG("ioctl_ethtool_data_len: id %lX, cmd: %X\n", id, cmd);
     switch (cmd) {
 	/* structs with fixed size */
+        case ETHTOOL_GSET:
+            return sizeof(struct ethtool_cmd);
+        case ETHTOOL_GDRVINFO:
+            return sizeof(struct ethtool_drvinfo);
 	case ETHTOOL_GWOL:
 	    /* cannot use sizeof, as this gives 2 padding junk bytes at the end */
 	    return offsetof(struct ethtool_wolinfo, sopass) + SOPASS_MAX;
@@ -815,6 +911,24 @@ ioctl_ethtool_data_len(unsigned long id, const void* data)
     }
 }
 
+static int
+ioctl_ethtool_in_execute(const ioctl_tree * node, unsigned long id, void *arg, int *ret)
+{
+    if (id == node->id) {
+	struct ifreq *nifr = node->data;
+	struct ifreq *ifr = arg;
+	uint32_t cmd = *((uint32_t*) ifr->ifr_data);
+	uint32_t ncmd = *((uint32_t*) nifr->ifr_data);
+	if (!strncmp(ifr->ifr_name, nifr->ifr_name, IFNAMSIZ) &&
+	    cmd == ncmd) {
+	    size_t size = node->type->get_data_size(node->id, node->data);
+	    memcpy(ifr->ifr_data, nifr->ifr_data, size);
+	    *ret = node->ret;
+	    return 1;
+	}
+    }
+    return 0;
+}
 
 /***********************************
  *
@@ -889,6 +1003,14 @@ ioctl_insertion_parent_stateless(ioctl_tree * tree, ioctl_tree * node)
      ioctl_varlenstruct_write, ioctl_varlenstruct_equal,                       \
      ioctl_varlenstruct_in_execute, insertion_parent_fn, data_size_fn}
 
+/* input structs is struct ifreq */
+#define I_STRUCT_IFREQ_IN(name, insertion_parent_fn, data_size_fn, execute_fn) \
+    {name, -1, 0, #name,						       \
+     ioctl_structifreq_init_from_bin, ioctl_structifreq_init_from_text,	       \
+     ioctl_structifreq_free_data,					       \
+     ioctl_structifreq_write, ioctl_structifreq_equal,			       \
+     execute_fn, insertion_parent_fn, data_size_fn}
+
 /* data with custom handlers; necessary for structs with pointers to nested
  * structs, or keeping stateful handlers */
 #define I_CUSTOM(name, nr_range, fn_prefix)                     \
@@ -945,7 +1067,7 @@ ioctl_type ioctl_db[] = {
 #endif
 
     /* ethtool */
-    I_VARLEN_STRUCT_IN(SIOCETHTOOL, ioctl_insertion_parent_stateless, ioctl_ethtool_data_len),
+    I_STRUCT_IFREQ_IN(SIOCETHTOOL, ioctl_insertion_parent_stateless, ioctl_ethtool_data_len, ioctl_ethtool_in_execute),
 
     /* terminator */
     {0, 0, 0, "", NULL, NULL, NULL, NULL, NULL}
